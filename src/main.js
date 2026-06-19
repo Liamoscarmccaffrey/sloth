@@ -1,4 +1,5 @@
 import { BrowserPod } from '@leaningtech/browserpod'
+import { buildZip } from './zip.js'
 
 // SLOTH's source lives one level up (sloth/), not on npm, so we ship it into
 // the Pod rather than installing it. Vite's `?raw` suffix inlines each file's
@@ -13,6 +14,7 @@ import controlsJs from '../lib/controls.js?raw'
 import slideHtmlJs from '../lib/slide-html.js?raw'
 import presentServerJs from '../lib/present-server.js?raw'
 import projectJs from '../lib/project.js?raw'
+import goghThemesJs from '../lib/gogh-themes.js?raw'
 
 // Two linked demo decks so wikilinks and the graph have real edges.
 import introMd from '../decks/intro.md?raw'
@@ -64,6 +66,7 @@ const FILES = {
   '/project/lib/controls.js': controlsJs,
   '/project/lib/slide-html.js': slideHtmlJs,
   '/project/lib/project.js': projectJs,
+  '/project/lib/gogh-themes.js': goghThemesJs,
   '/project/present-server.js': presentServerJs,
   '/project/intro.md': introMd,
   '/project/features.md': featuresMd,
@@ -129,11 +132,81 @@ for (const [globKey, contents] of Object.entries(POD_MODULES)) {
 // record its name in /project/.sloth-upload, which SLOTH polls for and opens.
 const UPLOAD_SENTINEL = 'sloth:upload'
 const UPLOAD_RESULT = '/project/.sloth-upload'
+const DOWNLOAD_SENTINEL = 'sloth:download-starter'
 
 pod.onOpen((urlOrPath) => {
-  if (urlOrPath !== UPLOAD_SENTINEL) return
-  if (fileInput) fileInput.click()
+  if (urlOrPath === UPLOAD_SENTINEL) { if (fileInput) fileInput.click(); return }
+  if (urlOrPath === DOWNLOAD_SENTINEL) { downloadStarterProject(); return }
 })
+
+// The empty SLOTH project structure a user fills in, then uploads back. Folders
+// carry a .gitkeep so they survive zipping; a sample deck, config, and README
+// show the convention and directives.
+function downloadStarterProject () {
+  const README = [
+    '# SLOTH project',
+    '',
+    'Lay out your talk in these folders, then zip and upload it to SLOTH.',
+    '',
+    '- content/       your .md decks (slides separated by a line of ---)',
+    '- media/         images, video, audio  -> ![](media/photo.png)',
+    '- attachments/   downloadable files     -> <!-- attach: attachments/notes.pdf -->',
+    '- snippets/      runnable code          -> <!-- run-snippet: snippets/demo.js -->',
+    '- repositories/  full apps on a portal  -> <!-- run-repo: repositories/app npm start -->',
+    '- config/        sloth.json, theme.json, controls.json',
+    '- data/          survey results, written locally (nothing leaves your browser)',
+    '',
+    'Other directives: <!-- cat: snippets/demo.js --> shows a file live on a slide.',
+    'Bare names resolve against the matching folder, so ![](photo.png) finds media/photo.png.',
+    ''
+  ].join('\n')
+
+  const INTRO = [
+    '%title: My SLOTH deck',
+    '%author: ',
+    '',
+    '# My deck',
+    '',
+    'Welcome. Replace this with your talk.',
+    '',
+    '---',
+    '',
+    '## A slide with an image',
+    '',
+    '![](media/example.png)',
+    '',
+    '---',
+    '',
+    '## A runnable snippet',
+    '',
+    '<!-- run-snippet: snippets/hello.js -->',
+    '',
+    'Press r while presenting to run it.',
+    ''
+  ].join('\n')
+
+  const HELLO = "console.log('hello from a SLOTH snippet')\n"
+
+  const CONFIG = JSON.stringify({ theme: 'default', notes: false }, null, 2) + '\n'
+
+  const folders = ['content', 'media', 'attachments', 'snippets', 'repositories', 'config', 'data']
+  const entries = []
+  for (const f of folders) entries.push({ name: 'sloth-project/' + f + '/.gitkeep', data: '' })
+  entries.push({ name: 'sloth-project/README.md', data: README })
+  entries.push({ name: 'sloth-project/content/intro.md', data: INTRO })
+  entries.push({ name: 'sloth-project/snippets/hello.js', data: HELLO })
+  entries.push({ name: 'sloth-project/config/sloth.json', data: CONFIG })
+
+  const blob = buildZip(entries)
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = 'sloth-project.zip'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 4000)
+}
 
 if (fileInput) {
   fileInput.addEventListener('change', async (e) => {

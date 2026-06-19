@@ -1089,6 +1089,83 @@ function cycleTheme () {
   theme = themes.get(names[(i + 1) % names.length])
 }
 
+// The theme picker: a scrollable, type-to-filter list of every available theme
+// (built-ins + Gogh), each with a colour preview. Enter activates and saves the
+// chosen theme; `e` opens the per-role configurator for fine-tuning.
+function openThemePicker (back) {
+  mode = 'themepick'
+  var all = themes.names()
+  var cur = all.indexOf(theme.name)
+  overlay = { all: all, filter: '', cursor: cur < 0 ? 0 : cur, top: 0, back: back || 'present' }
+}
+
+function filteredThemes () {
+  var q = overlay.filter.toLowerCase()
+  if (!q) return overlay.all
+  return overlay.all.filter(function (n) {
+    var t = themes.get(n)
+    return n.toLowerCase().indexOf(q) !== -1 || (t.label || '').toLowerCase().indexOf(q) !== -1
+  })
+}
+
+// A compact colour preview: solid blocks in the theme's main roles.
+function themeSwatch (t) {
+  return themes.paint('███', t.heading) + themes.paint('███', t.accent) +
+    themes.paint('███', t.link) + themes.paint('███', t.code) +
+    themes.paint('███', t.quote)
+}
+
+function drawThemePicker () {
+  var list = filteredThemes()
+  if (overlay.cursor >= list.length) overlay.cursor = Math.max(0, list.length - 1)
+
+  var rows = termRows()
+  var visible = rows - 8 // leave room for header, filter, footer
+  if (overlay.cursor < overlay.top) overlay.top = overlay.cursor
+  if (overlay.cursor >= overlay.top + visible) overlay.top = overlay.cursor - visible + 1
+
+  var body = ['', C('  Themes', 'heading', { bold: true }),
+    C('  ' + list.length + ' available    type to filter', 'dim'), '']
+  body.push('  filter: ' + C((overlay.filter || '') + '█', 'accent'))
+  body.push('')
+
+  for (var i = overlay.top; i < overlay.top + visible && i < list.length; i++) {
+    var name = list[i]
+    var t = themes.get(name)
+    var sel = i === overlay.cursor
+    var marker = sel ? C('❯ ', 'accent') : '  '
+    var label = t.label || name
+    if (label.length > 24) label = label.slice(0, 24)
+    while (label.length < 26) label += ' '
+    var active = name === theme.name ? C(' (current)', 'dim') : ''
+    body.push('  ' + marker + themeSwatch(t) + '  ' + (sel ? C(label, 'accent') : label) + active)
+  }
+
+  var footer = ' enter: use   ↑/↓: move   type: filter   tab: edit colours   esc: back'
+  drawFrame(' Themes', body, footer)
+}
+
+function themePickerKeys (ch, key) {
+  var list = filteredThemes()
+  if (key.name === 'escape') { mode = overlay.back; return draw() }
+  if (key.name === 'down') { overlay.cursor = Math.min(overlay.cursor + 1, list.length - 1); return draw() }
+  if (key.name === 'up') { overlay.cursor = Math.max(overlay.cursor - 1, 0); return draw() }
+  if (key.name === 'pagedown') { overlay.cursor = Math.min(overlay.cursor + 10, list.length - 1); return draw() }
+  if (key.name === 'pageup') { overlay.cursor = Math.max(overlay.cursor - 10, 0); return draw() }
+  if (isEnter(key)) {
+    if (list.length) { theme = themes.get(list[overlay.cursor]); themes.save(theme) }
+    return draw()
+  }
+  if (key.name === 'tab') { // fine-tune the current theme's colours
+    return (openThemeEditor('themepick'), draw())
+  }
+  if (key.name === 'backspace') { overlay.filter = overlay.filter.slice(0, -1); overlay.cursor = 0; return draw() }
+  if (ch && ch.length === 1 && ch >= ' ' && ch !== '\r' && ch !== '\n') {
+    overlay.filter += ch; overlay.cursor = 0; return draw()
+  }
+  draw()
+}
+
 // The theme configurator: pick a role, change its colour with h/l (named
 // colours) or type a #hex code, see it live on a preview, then `s` saves it
 // into theme.json. overlay.hex holds an in-progress hex entry (null otherwise).
@@ -1323,6 +1400,20 @@ function menuUpload () {
   draw()
 }
 
+// Download starter project: signal the page (which can trigger a browser
+// download) to build and download a zip of the empty project structure. The
+// page owns the zip + download; SLOTH just fires the sentinel.
+var DOWNLOAD_SENTINEL = 'sloth:download-starter'
+function downloadStarter () {
+  try {
+    cp.spawn('xdg-open', [DOWNLOAD_SENTINEL], { stdio: 'ignore', detached: true }).unref()
+  } catch (e) {}
+  overlay.toast = 'starter project downloading…'
+  draw()
+  // clear the toast shortly after
+  setTimeout(function () { if (mode === 'files' && overlay) { overlay.toast = null; draw() } }, 2500)
+}
+
 var uploadTimer = null
 function pollUpload () {
   if (uploadTimer) clearTimeout(uploadTimer)
@@ -1363,8 +1454,9 @@ function uploadKeys (ch, key) {
   draw()
 }
 
-// Settings: the theme configurator. Escape returns to the menu.
-function menuSettings () { openThemeEditor('menu'); draw() }
+// Settings: the theme picker (choose a whole theme). From there, `e` opens the
+// per-role configurator to fine-tune. Escape returns to the menu.
+function menuSettings () { openThemePicker('menu'); draw() }
 
 // Controls: view and rebind the present-mode keys, saved to controls.json.
 function menuControls () { openControls(); draw() }
@@ -1484,16 +1576,24 @@ function drawFiles () {
     var folders = projectFolders()
     var body = ['', C('  Project files', 'heading', { bold: true }),
       C('  ' + projectRoot(), 'dim'), '']
-    if (!folders.length) body.push(C('  no project folders found nearby', 'dim'))
+
+    // First row: download a starter project structure to author in any editor.
+    var dlSel = overlay.cursor === 0
+    body.push('  ' + (dlSel ? C('❯ ', 'accent') : '  ') +
+      (dlSel ? C('⬇ Download starter project', 'accent') : '⬇ Download starter project'))
+    body.push('')
+
+    if (!folders.length) body.push(C('  (upload a project, or download the starter above)', 'dim'))
     folders.forEach(function (f, i) {
-      var sel = i === overlay.cursor
+      var sel = (i + 1) === overlay.cursor // +1 because the download row is index 0
       var marker = sel ? C('❯ ', 'accent') : '  '
       var count = listFilesIn(f).length
       var label = f + '/'
       while (label.length < 16) label += ' '
       body.push('  ' + marker + (sel ? C(label, 'accent') : label) + C('' + count + ' file' + (count === 1 ? '' : 's'), 'dim'))
     })
-    drawFrame(' Files', body, ' enter: open folder   j/k: move   esc: back')
+    var f1 = overlay.toast ? ' ' + overlay.toast : ' enter: open / download   j/k: move   esc: back'
+    drawFrame(' Files', body, f1)
     return
   }
 
@@ -1526,16 +1626,17 @@ function filesKeys (ch, key) {
     return draw()
   }
 
-  // level 1: folder list
+  // level 1: folder list (index 0 is the "download starter" row)
   if (overlay.folder == null) {
     var folders = projectFolders()
+    var last = folders.length // download row at 0, folders at 1..folders.length
     if (key.name === 'escape' || ch === 'q') { openMenu() }
-    else if (key.name === 'j' || key.name === 'down') overlay.cursor = Math.min(overlay.cursor + 1, Math.max(0, folders.length - 1))
+    else if (key.name === 'j' || key.name === 'down') overlay.cursor = Math.min(overlay.cursor + 1, last)
     else if (key.name === 'k' || key.name === 'up') overlay.cursor = Math.max(overlay.cursor - 1, 0)
-    else if (isEnter(key) && folders.length) {
-      overlay.folder = folders[overlay.cursor]
-      overlay.files = listFilesIn(overlay.folder)
-      overlay.cursor = 0
+    else if (isEnter(key)) {
+      if (overlay.cursor === 0) { return downloadStarter() } // download starter project
+      var f = folders[overlay.cursor - 1]
+      if (f) { overlay.folder = f; overlay.files = listFilesIn(f); overlay.cursor = 0 }
     }
     return draw()
   }
@@ -1611,6 +1712,7 @@ function draw () {
     case 'graph': return drawGraph()
     case 'browse': return drawBrowse()
     case 'edit': return drawEditor()
+    case 'themepick': return drawThemePicker()
     case 'theme': return drawThemeEditor()
   }
 }
@@ -1680,6 +1782,7 @@ keyStream.on('keypress', function (ch, key) {
   if (mode === 'search') return searchKeys(ch, key)
   if (mode === 'browse') return browseKeys(ch, key)
   if (mode === 'graph') return graphKeys(ch, key)
+  if (mode === 'themepick') return themePickerKeys(ch, key)
   if (mode === 'theme') return themeKeys(ch, key)
   return presentKeys(ch, key)
 })
@@ -1759,7 +1862,7 @@ function doPresentAction (action) {
     case 'map': openGraph(); return draw()
     case 'notes': showNotes = !showNotes; break
     case 'theme': cycleTheme(); break
-    case 'config': openThemeEditor(); return draw()
+    case 'config': openThemePicker('present'); return draw()
     case 'jump': jumpBuf = ''; break
     case 'followLink': return followLink(0)
     case 'back': return goBack()
@@ -1785,7 +1888,11 @@ function themeKeys (ch, key) {
     return draw()
   }
 
-  if (key.name === 'escape' || ch === 'q') { mode = overlay.back }
+  if (key.name === 'escape' || ch === 'q') {
+    // returning to the picker rebuilds its list state; elsewhere just switch mode
+    if (overlay.back === 'themepick') return (openThemePicker('menu'), draw())
+    mode = overlay.back
+  }
   else if (key.name === 'j' || key.name === 'down') { overlay.cursor = Math.min(overlay.cursor + 1, roles.length - 1); overlay.saved = false }
   else if (key.name === 'k' || key.name === 'up') { overlay.cursor = Math.max(overlay.cursor - 1, 0); overlay.saved = false }
   else if (key.name === 'right' || ch === 'l') { theme[role] = themes.nextColor(theme[role]); overlay.saved = false }
