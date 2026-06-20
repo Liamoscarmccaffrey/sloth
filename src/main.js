@@ -153,6 +153,7 @@ pod.onOpen((urlOrPath) => {
   if (urlOrPath === 'sloth:download-project') { downloadCurrentProject(); return }
   if (urlOrPath === 'sloth:menu') { showHomeLogo(true); return }
   if (urlOrPath === 'sloth:deck') { showHomeLogo(false); return }
+  if (urlOrPath === 'sloth:portal-close') { closePortalPanel(); return }
 })
 
 // Read a whole text file out of the Pod.
@@ -495,7 +496,25 @@ if (penCanvas) {
 }
 
 // Create the visible terminal.
-const terminal = await pod.createDefaultTerminal(document.querySelector('#console'))
+const consoleEl = document.querySelector('#console')
+const terminal = await pod.createDefaultTerminal(consoleEl)
+
+// The terminal only receives keystrokes once its input element has focus. The
+// browser doesn't give it focus on load, so the menu looked dead until you
+// clicked the window. Focus xterm's input now, and again whenever the page is
+// clicked anywhere outside the portal, so the arrow keys work immediately.
+function focusTerminal () {
+  const ta = consoleEl && consoleEl.querySelector('textarea')
+  if (ta) ta.focus()
+}
+focusTerminal()
+// Retry briefly in case the textarea isn't mounted the instant boot resolves.
+const focusTries = [0, 60, 200, 500]
+focusTries.forEach((d) => setTimeout(focusTerminal, d))
+window.addEventListener('mousedown', (e) => {
+  if (e.target && e.target.closest && e.target.closest('#portal')) return
+  setTimeout(focusTerminal, 0)
+})
 
 // No install step: node_modules was written above, so SLOTH is ready to run.
 

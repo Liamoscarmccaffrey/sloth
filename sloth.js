@@ -938,8 +938,11 @@ function writePresentSlides () {
 function writePresentState () {
   presentRev++
   lastPresentRev = presentRev // remember our own write so the poll ignores it
+  // Preserve the clicker action counters the server maintains, so rewriting the
+  // state (e.g. after a style toggle) doesn't reset them and re-fire actions.
   writeJsonFile('present-state.json', {
-    index: slideIndex, style: presentStyle, rev: presentRev, total: deck.slides.length
+    index: slideIndex, style: presentStyle, rev: presentRev, total: deck.slides.length,
+    runReq: lastRunReq, styleReq: lastStyleReq
   })
 }
 
@@ -947,6 +950,8 @@ function writePresentState () {
 // writes into present-state.json) moves the presenter view too. The clicker
 // bumps rev to a value we didn't write, so we detect that and adopt its index.
 var lastPresentRev = 0
+var lastStyleReq = 0
+var lastRunReq = 0
 var presentPollTimer = null
 function startPresentPoll () {
   if (presentPollTimer) clearTimeout(presentPollTimer)
@@ -962,6 +967,20 @@ function startPresentPoll () {
       draw()
     } else if (st && st.rev > lastPresentRev) {
       lastPresentRev = st.rev
+    }
+    // Clicker action buttons. The server records each as a counter in the state
+    // file; perform it when the counter increases past what we've already seen.
+    if (st) {
+      if (st.styleReq != null && st.styleReq > lastStyleReq) {
+        lastStyleReq = st.styleReq
+        presentStyle = presentStyle === 'clean' ? 'terminal' : 'clean'
+        writePresentState()
+        draw()
+      }
+      if (st.runReq != null && st.runReq > lastRunReq) {
+        lastRunReq = st.runReq
+        if (slideHasRun(curSlide())) { runSlide(); draw() }
+      }
     }
     // redraw once when the clicker URL first becomes available, so its QR shows
     if (mode === 'presenter' && clickerShown && !clickerUrlSeen && portalClickerUrl()) {
@@ -996,6 +1015,13 @@ function startPresent () {
   mode = 'presenter'
   startPresentPoll() // follow clicker taps written into the state file
   draw()
+  // The audience server's portal opens the side panel a moment later, which
+  // shrinks the terminal. The resize repaint can race the first frame, leaving
+  // a stale full-width frame (notes/next pushed off) until the next keypress.
+  // Force a clean repaint once the panel has settled so the view is complete.
+  setTimeout(function () {
+    if (mode === 'presenter') { process.stdout.write('\x1b[2J\x1b[H'); draw() }
+  }, 500)
 }
 
 function presenterAdvance (delta) {
@@ -1004,8 +1030,9 @@ function presenterAdvance (delta) {
   writePresentState()
 }
 
-// Whether the clicker QR is shown in the presenter view (toggle with k).
-var clickerShown = true
+// Whether the clicker QR is shown in the presenter view. Off by default; the
+// host presses k to show it when they want to hand out the phone remote.
+var clickerShown = false
 
 // The clicker URL = the audience portal URL (written to .sloth-portal by the
 // page) with /clicker appended.
@@ -1071,6 +1098,8 @@ function presenterKeys (ch, key) {
   if (key.name === 'escape' || ch === 'q') {
     if (presentProc) { try { presentProc.kill() } catch (e) {} ; presentProc = null }
     if (presentPollTimer) { clearTimeout(presentPollTimer); presentPollTimer = null }
+    // Tell the page to close the side panel; the audience server is gone now.
+    try { cp.spawn('xdg-open', ['sloth:portal-close'], { stdio: 'ignore', detached: true }).unref() } catch (e) {}
     openMenu(); return draw()
   }
   else if (key.name === 'right' || key.name === 'pagedown' || key.name === 'space' || isEnter(key)) presenterAdvance(1)
