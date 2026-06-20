@@ -19,9 +19,30 @@ html, body {
 
 /* The stage lays the terminal and the (optional) portal panel side by side. */
 #stage {
+  position: relative;
   display: flex;
   width: 100vw;
   height: 100vh;
+}
+
+/* Home-screen logo, overlaid on the top band the menu reserves for it. Shown
+   only on the home screen (toggled from main.js). pointer-events:none so it
+   never intercepts clicks meant for the terminal. */
+#home-logo {
+  position: absolute;
+  top: 18vh;
+  left: 50%;
+  transform: translateX(-50%);
+  height: 26vh;
+  width: auto;
+  max-width: 80vw;
+  object-fit: contain;
+  pointer-events: none;
+  z-index: 5;
+}
+
+#home-logo[hidden] {
+  display: none;
 }
 
 #console {
@@ -81,9 +102,63 @@ body.split #portal {
   font-size: 0.9rem;
 }
 
-#portal-frame {
+/* The body holds the iframe and the draw canvas stacked. */
+#portal-body {
+  position: relative;
   flex: 1 1 auto;
+  min-height: 0;
+}
+
+#portal-frame {
+  position: absolute;
+  inset: 0;
   width: 100%;
+  height: 100%;
   border: none;
   background: #fff;
 }
+
+/* While drawing, the iframe must not capture the mouse, or strokes break the
+   moment the cursor moves over it. The canvas on top takes all the events. */
+body.drawing #portal-frame { pointer-events: none; }
+
+/* Draw layer over the iframe. Hidden / non-interactive until draw mode is on,
+   so normal clicks reach the portal; in draw mode it captures the mouse. */
+#pen-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  z-index: 3;
+  cursor: crosshair;
+}
+#pen-canvas[hidden] { display: none; }
+
+/* Pen toolbar in the portal bar. */
+#pen-tools[hidden] { display: none; }
+#pen-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.pen-sw {
+  width: 1.2rem;
+  height: 1.2rem;
+  border-radius: 50%;
+  border: 2px solid #555;
+  padding: 0;
+  cursor: pointer;
+}
+.pen-sw.sel { border-color: #fff; }
+#pen-clear, #pen-toggle {
+  flex: 0 0 auto;
+  background: #2a2a2a;
+  color: #ccc;
+  border: none;
+  cursor: pointer;
+  font-size: 0.8125rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 0.25rem;
+}
+#pen-toggle.on { background: #1a3a4a; color: #9cf; }

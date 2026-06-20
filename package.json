@@ -12,6 +12,7 @@
     "vite": "^7.2.4"
   },
   "dependencies": {
-    "@leaningtech/browserpod": "latest"
+    "@leaningtech/browserpod": "latest",
+    "qrcode-generator": "^2.0.4"
   }
 }

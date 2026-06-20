@@ -44,6 +44,7 @@ var wrap = require('./lib/wrap')
 var controls = require('./lib/controls')
 var slideHtml = require('./lib/slide-html')
 var project = require('./lib/project')
+var qr = require('./lib/qr')
 
 // ---------------------------------------------------------------------------
 // CLI / entry
@@ -235,6 +236,35 @@ function parseSlide (chunk, idx) {
     attachments.push({ file: am[1], label: (am[2] && am[2].trim()) || am[1] })
   }
 
+  // survey blocks. A multi-line directive becomes a form on the audience portal;
+  // responses are written to data/ on the Pod (nothing leaves the browser). Each
+  // question is one line, typed by its prefix:
+  //   <!-- survey id: feedback
+  //   single: How was this talk? | Great | Good | Could be better
+  //   multi: Which parts landed? | Intro | Demo | Q&A
+  //   rating: Rate the pacing
+  //   text: Any other comments?
+  //   -->
+  // Types: single (radio), multi (checkbox), rating (1-5), text (free text).
+  var surveys = []
+  var surveyRe = /<!--\s*survey\b([^\n]*)([\s\S]*?)-->/g
+  var sv
+  while ((sv = surveyRe.exec(chunk))) {
+    var idm = /\bid\s*:\s*(\S+)/.exec(sv[1])
+    var id = (idm ? idm[1] : 'survey').replace(/[^\w.-]/g, '_')
+    var questions = []
+    sv[2].split('\n').forEach(function (l) {
+      var qm = /^\s*(single|multi|rating|text)\s*:\s*(.+)$/i.exec(l)
+      if (!qm) return
+      var type = qm[1].toLowerCase()
+      var rest = qm[2].split('|').map(function (s) { return s.trim() }).filter(function (s, i) { return i === 0 || s })
+      var q = { type: type, q: rest[0] }
+      if (type === 'single' || type === 'multi') q.options = rest.slice(1)
+      questions.push(q)
+    })
+    if (questions.length) surveys.push({ id: id, questions: questions })
+  }
+
   // cat directives: <!-- cat: <file> --> renders that file's live contents
   // (read at present time) inline where the directive sits.
   var cats = []
@@ -280,6 +310,7 @@ function parseSlide (chunk, idx) {
     runs: runs,
     repos: repos,
     attachments: attachments,
+    surveys: surveys,
     cats: cats
   }
 }
@@ -366,6 +397,10 @@ function renderSlide (deck, slide, revealCount) {
   })
   src = src.replace(/<!--\s*attach:\s*(\S+)\s*([^\n]*?)\s*-->/g, function (_, f, label) {
     return ' DOWNLOAD  ' + ((label && label.trim()) || f) + '   (on the audience portal)'
+  })
+  src = src.replace(/<!--\s*survey\b([\s\S]*?)-->/g, function (_, body) {
+    var first = /^\s*(?:single|multi|rating|text)\s*:\s*([^|\n]+)/im.exec(body)
+    return ' SURVEY  ' + (first ? first[1].trim() : '(audience form)') + '   (answers saved to data/ as CSV)'
   })
   src = src.replace(/<!--\s*run:\s*([^\n]*?)\s*-->/g, function (_, spec) {
     var cmd = spec.replace(/\bas:\s*\S+/, '').trim()
@@ -848,8 +883,41 @@ function ansiLineToHtml (line) {
   return out
 }
 
-// Build the slide HTML sets (clean + terminal) for every slide and write them,
-// plus the initial state, into the deck dir for the audience server to serve.
+// Build the audience survey form(s) for a slide. The form POSTs to /survey on
+// the present server, which appends responses to data/ as CSV. Each question
+// renders by type; field names are q0, q1, ... so responses map back to columns.
+function surveyFormHtml (slide) {
+  if (!slide.surveys || !slide.surveys.length) return ''
+  function esc (s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;') }
+  return slide.surveys.map(function (s) {
+    var qHtml = s.questions.map(function (q, qi) {
+      var nm = 'q' + qi
+      var head = '<div class="q">' + esc(q.q) + '</div>'
+      var field = ''
+      if (q.type === 'single') {
+        field = (q.options || []).map(function (o) {
+          return '<label><input type="radio" name="' + nm + '" value="' + esc(o) + '"> ' + esc(o) + '</label>'
+        }).join('')
+      } else if (q.type === 'multi') {
+        field = (q.options || []).map(function (o) {
+          return '<label><input type="checkbox" name="' + nm + '" value="' + esc(o) + '"> ' + esc(o) + '</label>'
+        }).join('')
+      } else if (q.type === 'rating') {
+        var r = ''
+        for (var n = 1; n <= 5; n++) r += '<label class="rate"><input type="radio" name="' + nm + '" value="' + n + '"> ' + n + '</label>'
+        field = '<div class="rating">' + r + '</div>'
+      } else { // text
+        field = '<textarea name="' + nm + '" rows="3" placeholder="your answer"></textarea>'
+      }
+      return '<div class="sq">' + head + field + '</div>'
+    }).join('')
+    // carry the question texts so the server can write a CSV header
+    var cols = JSON.stringify(s.questions.map(function (q) { return q.q }))
+    return '<form class="survey" data-id="' + esc(s.id) + '" data-cols="' + esc(cols) + '">' +
+      qHtml + '<button type="submit">Submit</button></form>'
+  }).join('')
+}
+
 function writePresentSlides () {
   var clean = []
   var terminal = []
@@ -858,18 +926,52 @@ function writePresentSlides () {
     var allLines = []
     slide.steps.forEach(function (st) { allLines = allLines.concat(st) })
     var r = slideHtml(allLines)
-    clean.push((r.centered ? '<div class="center">' : '<div>') + r.html + '</div>')
-    // terminal: SLOTH's own ANSI render, converted to HTML
+    var form = surveyFormHtml(slide)
+    clean.push((r.centered ? '<div class="center">' : '<div>') + r.html + form + '</div>')
+    // terminal: SLOTH's own ANSI render, converted to HTML, plus the same form
     var ansi = renderSlide(deck, slide, slide.steps.length - 1)
-    terminal.push(ansi.map(ansiLineToHtml).join('\n'))
+    terminal.push(ansi.map(ansiLineToHtml).join('\n') + form)
   })
   writeJsonFile('present-slides.json', { clean: clean, terminal: terminal })
 }
 
 function writePresentState () {
   presentRev++
-  writeJsonFile('present-state.json', { index: slideIndex, style: presentStyle, rev: presentRev })
+  lastPresentRev = presentRev // remember our own write so the poll ignores it
+  writeJsonFile('present-state.json', {
+    index: slideIndex, style: presentStyle, rev: presentRev, total: deck.slides.length
+  })
 }
+
+// Poll the state file while presenting so a phone-clicker tap (which the server
+// writes into present-state.json) moves the presenter view too. The clicker
+// bumps rev to a value we didn't write, so we detect that and adopt its index.
+var lastPresentRev = 0
+var presentPollTimer = null
+function startPresentPoll () {
+  if (presentPollTimer) clearTimeout(presentPollTimer)
+  presentPollTimer = setTimeout(function () {
+    if (mode !== 'presenter' && mode !== 'present') { presentPollTimer = null; return }
+    var st = null
+    try { st = JSON.parse(fs.readFileSync(path.join(path.dirname(deck.file), 'present-state.json'), 'utf-8')) } catch (e) {}
+    if (st && st.rev > lastPresentRev && st.index !== slideIndex) {
+      lastPresentRev = st.rev
+      slideIndex = st.index
+      revealCount = 0
+      clampSlide()
+      draw()
+    } else if (st && st.rev > lastPresentRev) {
+      lastPresentRev = st.rev
+    }
+    // redraw once when the clicker URL first becomes available, so its QR shows
+    if (mode === 'presenter' && clickerShown && !clickerUrlSeen && portalClickerUrl()) {
+      clickerUrlSeen = true
+      draw()
+    }
+    startPresentPoll()
+  }, 350)
+}
+var clickerUrlSeen = false
 
 function writeJsonFile (name, obj) {
   try { fs.writeFileSync(path.join(path.dirname(deck.file), name), JSON.stringify(obj)) } catch (e) {}
@@ -878,6 +980,8 @@ function writeJsonFile (name, obj) {
 function startPresent () {
   if (!deck) return
   presentStyle = 'clean'
+  clickerUrlSeen = false
+  try { fs.unlinkSync(PORTAL_RESULT) } catch (e) {} // clear a stale portal URL
   writePresentSlides()
   writePresentState()
   // spawn the audience server (shipped to the deck dir as present-server.js)
@@ -890,6 +994,7 @@ function startPresent () {
     presentProc.on('error', function () {})
   } catch (e) {}
   mode = 'presenter'
+  startPresentPoll() // follow clicker taps written into the state file
   draw()
 }
 
@@ -897,6 +1002,18 @@ function presenterAdvance (delta) {
   slideIndex += delta
   clampSlide()
   writePresentState()
+}
+
+// Whether the clicker QR is shown in the presenter view (toggle with k).
+var clickerShown = true
+
+// The clicker URL = the audience portal URL (written to .sloth-portal by the
+// page) with /clicker appended.
+function portalClickerUrl () {
+  var u = null
+  try { u = fs.readFileSync(PORTAL_RESULT, 'utf-8').trim() } catch (e) {}
+  if (!u) return null
+  return u.replace(/\/+$/, '') + '/clicker'
 }
 
 function drawPresenter () {
@@ -929,22 +1046,39 @@ function drawPresenter () {
     body.push(C('  (end)', 'dim'))
   }
 
+  // Clicker QR: scan it with a phone to use it as a remote. The audience URL
+  // comes from the portal handshake the page writes; /clicker on that host is
+  // the remote page.
+  if (clickerShown) {
+    var url = portalClickerUrl()
+    body.push('')
+    body.push(C('  ── phone clicker + pen (scan to control & draw) ──', 'accent'))
+    if (url) {
+      qr.render(qr.encode(url)).forEach(function (l) { body.push('  ' + l) })
+      body.push(C('  ' + url, 'dim'))
+    } else {
+      body.push(C('  waiting for the audience URL…', 'dim'))
+    }
+  }
+
   var titleBar = ' PRESENTING  ' + deck.meta.title
   var footer = ' ←/→ change slide' + (slideHasRun(slide) ? '    ' + keyFor('run') + ': run' : '') +
-    '    s: audience style    esc: stop presenting'
+    '    s: style    k: clicker QR    esc: stop'
   drawFrame(titleBar, body, footer)
 }
 
 function presenterKeys (ch, key) {
   if (key.name === 'escape' || ch === 'q') {
     if (presentProc) { try { presentProc.kill() } catch (e) {} ; presentProc = null }
-    mode = 'present'
+    if (presentPollTimer) { clearTimeout(presentPollTimer); presentPollTimer = null }
+    openMenu(); return draw()
   }
   else if (key.name === 'right' || key.name === 'pagedown' || key.name === 'space' || isEnter(key)) presenterAdvance(1)
   else if (key.name === 'left' || key.name === 'pageup' || key.name === 'backspace') presenterAdvance(-1)
   // run the current slide's code block (returns to the presenter view after)
   else if (controls.actionFor(ch) === 'run' && slideHasRun(curSlide())) return (runSlide(), draw())
   else if (ch === 's') { presentStyle = presentStyle === 'clean' ? 'terminal' : 'clean'; writePresentState() }
+  else if (ch === 'k') { clickerShown = !clickerShown }
   draw()
 }
 
@@ -1045,7 +1179,8 @@ function openBrowse (intent, back) {
 }
 
 function drawBrowse () {
-  var title = overlay.intent === 'edit' ? '  Edit a deck' : '  Open a deck'
+  var titles = { edit: '  Edit a deck', live: '  Present a deck', survey: '  Add a survey to which deck?' }
+  var title = titles[overlay.intent] || '  Open a deck'
   var body = ['', C(title, 'heading', { bold: true }), '']
   if (!overlay.files.length) body.push('  no markdown files found nearby')
   overlay.files.forEach(function (f, i) {
@@ -1219,7 +1354,9 @@ var MENU_ITEMS = [
   { key: 'Open', desc: 'pick a deck to view', action: menuOpen },
   { key: 'Present', desc: 'present to an audience on a shareable URL', action: menuPresent },
   { key: 'Edit', desc: 'pick a deck to edit', action: menuEdit },
+  { key: 'Survey', desc: 'add an audience survey to the current deck', action: menuSurvey },
   { key: 'Upload', desc: 'add a .md file from your computer', action: menuUpload },
+  { key: 'Download', desc: 'save the current project (with survey data) as a zip', action: menuDownload },
   { key: 'Files', desc: 'create files for runnable code (package.json, etc.)', action: menuFiles },
   { key: 'Controls', desc: 'view and rebind the presenting keys', action: menuControls },
   { key: 'Settings', desc: 'configure colours and theme', action: menuSettings },
@@ -1243,18 +1380,12 @@ function drawMenu () {
   var rows = termRows()
 
   var block = []
-  // Header: the sloth ASCII art, downscaled to fit. Reserve roughly the top
-  // half of the screen for it; fall back to the big SLOTH wordmark if absent.
-  if (slothArt) {
-    var header = scaleArt(slothArt, cols - 4, Math.max(8, Math.floor((rows - 2) * 0.45)))
-    header.forEach(function (al) { block.push(hcenter(C(al, 'big'), cols)) })
-    block.push('')
-    block.push(hcenter(C('S L O T H', 'heading', { bold: true }), cols))
-  } else {
-    var big = bigHeaders.render('SLOTH', theme, cols - 4, 2)
-    big.forEach(function (bl) { block.push(hcenter(bl, cols)) })
-  }
-  block.push('')
+  // The host page overlays a PNG logo at the top of the home screen (the
+  // terminal can't render images), so leave a blank band here for it. If the
+  // page logo fails to load it just shows empty space, so keep a small text
+  // wordmark below as a graceful fallback cue.
+  var logoBand = Math.max(6, Math.floor((rows - 2) * 0.32))
+  for (var lb = 0; lb < logoBand; lb++) block.push('')
   block.push(hcenter(C('terminal slide decks', 'dim'), cols))
   block.push('')
   block.push('')
@@ -1295,7 +1426,10 @@ function drawMenu () {
   // Body lines are already centered; render with no indent and body starting
   // right below the top bar. No quit option: this is the app's home, and the
   // page relaunches SLOTH if the process ever exits, so quitting is meaningless.
-  drawFrame(' SLOTH', body, ' enter: choose    ↑/↓ or j/k: move', { indent: 0, top: 1 })
+  var footer = overlay && overlay.toast
+    ? ' ' + overlay.toast
+    : ' enter: choose    ↑/↓ or j/k: move'
+  drawFrame(' SLOTH', body, footer, { indent: 0, top: 1 })
 }
 
 function menuKeys (ch, key) {
@@ -1412,6 +1546,264 @@ function downloadStarter () {
   draw()
   // clear the toast shortly after
   setTimeout(function () { if (mode === 'files' && overlay) { overlay.toast = null; draw() } }, 2500)
+}
+
+// Survey: a guided wizard that builds a typed survey and writes it into the
+// deck as a survey block (which renders as a form on the audience portal).
+function menuSurvey () {
+  // With no deck open, pick one first; the browser's 'survey' intent then opens
+  // the wizard on the chosen deck.
+  if (!deck) return (openBrowse('survey', 'menu'), draw())
+  openSurveyWizard()
+}
+
+// Wizard state lives in overlay:
+//   { id, questions:[{type,q,options?}], step, draft:{...} }
+// step: 'menu' (the action list), 'addq' (choosing a type), or a typing step.
+function openSurveyWizard () {
+  mode = 'wizard'
+  overlay = { id: 'feedback', questions: [], step: 'menu', input: '', draft: null }
+}
+
+var WIZ_TYPES = [
+  { type: 'single', label: 'Single choice (pick one)' },
+  { type: 'multi', label: 'Multiple choice (pick many)' },
+  { type: 'rating', label: 'Rating (1-5)' },
+  { type: 'text', label: 'Free text' }
+]
+
+// The main wizard screen is a normal arrow+Enter list, like every other screen.
+// Rows: each question (Enter removes it), then Add a question / Set id / Write.
+function wizardMenuRows () {
+  var o = overlay
+  var rows = []
+  o.questions.forEach(function (q, i) {
+    var opts = q.options && q.options.length ? '  [' + q.options.join(', ') + ']' : ''
+    rows.push({ kind: 'q', i: i, label: '(' + q.type + ') ' + q.q + opts })
+  })
+  rows.push({ kind: 'add', label: '+ Add a question' })
+  rows.push({ kind: 'id', label: 'Survey id: ' + o.id })
+  rows.push({ kind: 'write', label: o.questions.length ? 'Write survey to deck' : 'Write survey to deck (add a question first)' })
+  return rows
+}
+
+function drawWizard () {
+  var o = overlay
+  var body = ['', C('  Build a survey', 'heading', { bold: true }),
+    C('  answers are saved locally to data/responses-' + o.id + '.csv', 'dim'), '']
+
+  if (o.step === 'id') {
+    body.push('  survey id: ' + C(o.input + '█', 'accent'))
+    return drawFrame(' Survey wizard', body, ' type an id, then enter   esc to cancel')
+  }
+  if (o.step === 'qtext') {
+    body.push('  ' + C(o.draft.type, 'accent') + ' question:')
+    body.push('  ' + C(o.input + '█', 'accent'))
+    return drawFrame(' Survey wizard', body, ' type the question, then enter   esc to cancel')
+  }
+  if (o.step === 'qopt') {
+    body.push('  question: ' + o.draft.q)
+    body.push('  options: ' + (o.draft.options.length ? o.draft.options.join(', ') : C('(none yet)', 'dim')))
+    body.push('')
+    body.push('  add option: ' + C(o.input + '█', 'accent'))
+    return drawFrame(' Survey wizard', body, ' enter adds an option, empty enter finishes   esc to cancel')
+  }
+  if (o.step === 'addq') {
+    body.push(C('  choose a question type', 'dim'))
+    body.push('')
+    WIZ_TYPES.forEach(function (t, i) {
+      var sel = i === o.cursor
+      body.push('  ' + (sel ? C('❯ ', 'accent') : '  ') + (sel ? C(t.label, 'accent') : t.label))
+    })
+    return drawFrame(' Survey wizard', body, ' ↑/↓ move    enter pick    esc back')
+  }
+
+  // main list
+  var rows = wizardMenuRows()
+  rows.forEach(function (r, i) {
+    var sel = i === o.cursor
+    var marker = sel ? C('❯ ', 'accent') : '  '
+    var label = (r.kind === 'q') ? C((r.i + 1) + '. ', 'accent') + r.label : r.label
+    body.push('  ' + marker + (sel ? C(stripAnsi(label), 'accent') : label))
+  })
+  drawFrame(' Survey wizard', body, ' ↑/↓ move    enter select    (on a question, enter removes it)    esc cancel')
+}
+
+function wizardKeys (ch, key) {
+  var o = overlay
+  var typing = (ch && ch.length === 1 && ch >= ' ' && ch !== '\r' && ch !== '\n')
+
+  if (o.step === 'id') {
+    if (key.name === 'escape') { o.step = 'menu' }
+    else if (isEnter(key)) { if (o.input.trim()) o.id = o.input.trim().replace(/[^\w.-]/g, '_'); o.input = ''; o.step = 'menu' }
+    else if (key.name === 'backspace') o.input = o.input.slice(0, -1)
+    else if (typing) o.input += ch
+    return draw()
+  }
+  if (o.step === 'qtext') {
+    if (key.name === 'escape') { o.draft = null; o.input = ''; o.step = 'menu' }
+    else if (isEnter(key)) {
+      if (!o.input.trim()) return draw()
+      o.draft.q = o.input.trim(); o.input = ''
+      if (o.draft.type === 'single' || o.draft.type === 'multi') { o.draft.options = []; o.step = 'qopt' }
+      else { o.questions.push(o.draft); o.draft = null; o.step = 'menu' }
+    }
+    else if (key.name === 'backspace') o.input = o.input.slice(0, -1)
+    else if (typing) o.input += ch
+    return draw()
+  }
+  if (o.step === 'qopt') {
+    if (key.name === 'escape') { o.draft = null; o.input = ''; o.step = 'menu' }
+    else if (isEnter(key)) {
+      if (o.input.trim()) { o.draft.options.push(o.input.trim()); o.input = '' }
+      else { if (o.draft.options.length) o.questions.push(o.draft); o.draft = null; o.step = 'menu' }
+    }
+    else if (key.name === 'backspace') o.input = o.input.slice(0, -1)
+    else if (typing) o.input += ch
+    return draw()
+  }
+  if (o.step === 'addq') {
+    if (key.name === 'escape') { o.step = 'menu' }
+    else if (key.name === 'j' || key.name === 'down') o.cursor = Math.min((o.cursor || 0) + 1, WIZ_TYPES.length - 1)
+    else if (key.name === 'k' || key.name === 'up') o.cursor = Math.max((o.cursor || 0) - 1, 0)
+    else if (isEnter(key)) { o.draft = { type: WIZ_TYPES[o.cursor || 0].type, q: '' }; o.input = ''; o.step = 'qtext' }
+    return draw()
+  }
+
+  // main list: arrows + enter, consistent with the rest of the app
+  var rows = wizardMenuRows()
+  if (o.cursor == null || o.cursor >= rows.length) o.cursor = 0
+  if (key.name === 'escape') { openMenu() }
+  else if (key.name === 'j' || key.name === 'down') o.cursor = Math.min(o.cursor + 1, rows.length - 1)
+  else if (key.name === 'k' || key.name === 'up') o.cursor = Math.max(o.cursor - 1, 0)
+  else if (isEnter(key)) {
+    var r = rows[o.cursor]
+    if (r.kind === 'q') { o.questions.splice(r.i, 1); if (o.cursor >= wizardMenuRows().length) o.cursor = 0 } // remove
+    else if (r.kind === 'add') { o.cursor = 0; o.step = 'addq' }
+    else if (r.kind === 'id') { o.input = o.id; o.step = 'id' }
+    else if (r.kind === 'write' && o.questions.length) { return writeSurveyToDeck() }
+  }
+  draw()
+}
+
+// Compose the survey block from the wizard's questions and append it as a new
+// slide to the open deck, then open the editor there.
+function writeSurveyToDeck () {
+  var lines = ['', '---', '', '## Your turn', '', '<!-- survey id: ' + overlay.id]
+  overlay.questions.forEach(function (q) {
+    if (q.type === 'single' || q.type === 'multi') {
+      lines.push(q.type + ': ' + q.q + ' | ' + q.options.join(' | '))
+    } else {
+      lines.push(q.type + ': ' + q.q)
+    }
+  })
+  lines.push('-->', '')
+  try { fs.appendFileSync(deck.file, lines.join('\n')) } catch (e) {}
+  loadDeck(deck.file, false)
+  slideIndex = deck.slides.length - 1
+  mode = 'present' // show the new survey slide
+  draw()
+}
+
+// Download the CURRENT project. SLOTH (in the Pod) can read the filesystem but
+// can't trigger a browser download; the page can build/download a zip but can't
+// read the Pod tree. So SLOTH walks the project, writes a manifest of every
+// file (base64) to .sloth-download.json, and signals the page to zip + save it.
+var DOWNLOAD_PROJECT_SENTINEL = 'sloth:download-project'
+var DOWNLOAD_MANIFEST = path.resolve('.sloth-download.json')
+
+// SLOTH's own machinery / demo files, never part of a user's exported project.
+var DOWNLOAD_SKIP = {
+  'node_modules': 1, 'present-server.js': 1, 'present-slides.json': 1,
+  'present-state.json': 1, 'sloth.js': 1, 'sloth-art.txt': 1, 'lib': 1,
+  'package.json': 1, 'package-lock.json': 1, 'intro.md': 1, 'features.md': 1
+}
+var CONVENTION = ['content', 'media', 'attachments', 'snippets', 'repositories', 'config', 'data']
+
+function menuDownload () {
+  var root = deck ? projectRoot() : path.resolve('.')
+  var name = (deck ? path.basename(root) : 'sloth-project') || 'sloth-project'
+  if (name === 'project') name = 'sloth-project' // /project -> friendlier name
+  var files = [] // { name, b64 }
+
+  function addFile (relPath, full) {
+    try { files.push({ name: name + '/' + relPath, b64: fs.readFileSync(full).toString('base64') }) } catch (e) {}
+  }
+  function addText (relPath, text) {
+    files.push({ name: name + '/' + relPath, b64: Buffer.from(text, 'utf-8').toString('base64') })
+  }
+
+  var hasConvention = CONVENTION.some(function (f) { return fileExistsSafe(path.join(root, f)) })
+
+  if (hasConvention) {
+    // export the existing convention folders verbatim (minus SLOTH machinery)
+    CONVENTION.forEach(function (folder) {
+      var fdir = path.join(root, folder)
+      if (!fileExistsSafe(fdir)) return
+      ;(function walk (dir, rel, depth) {
+        if (depth > 5) return
+        var entries
+        try { entries = fs.readdirSync(dir) } catch (e) { return }
+        entries.forEach(function (n) {
+          if (n[0] === '.' || DOWNLOAD_SKIP[n]) return
+          var full = path.join(dir, n)
+          var st; try { st = fs.statSync(full) } catch (e) { return }
+          if (st.isDirectory()) walk(full, rel + n + '/', depth + 1)
+          else addFile(rel + n, full)
+        })
+      })(fdir, folder + '/', 0)
+    })
+  } else {
+    // a loose project: wrap the user's decks into content/ and scaffold the rest
+    var ddir = deck ? path.dirname(deck.file) : root
+    try {
+      fs.readdirSync(ddir).forEach(function (n) {
+        if (n[0] === '.' || DOWNLOAD_SKIP[n]) return
+        if (!/\.(md|markdown)$/i.test(n)) return
+        addFile('content/' + n, path.join(ddir, n))
+      })
+    } catch (e) {}
+  }
+
+  // always include survey results from data/ (created during Present)
+  var dataDir = path.join(root, 'data')
+  if (fileExistsSafe(dataDir)) {
+    try {
+      fs.readdirSync(dataDir).forEach(function (n) {
+        if (n[0] === '.') return
+        addFile('data/' + n, path.join(dataDir, n))
+      })
+    } catch (e) {}
+  }
+
+  // ensure every convention folder exists in the zip (a .gitkeep if empty)
+  CONVENTION.forEach(function (folder) {
+    var has = files.some(function (f) { return f.name.indexOf(name + '/' + folder + '/') === 0 })
+    if (!has) addText(folder + '/.gitkeep', '')
+  })
+
+  // a README describing the structure
+  addText('README.md', [
+    '# ' + name,
+    '',
+    'A SLOTH project. Edit the decks in content/, then upload the folder to SLOTH.',
+    '',
+    '- content/      your .md decks',
+    '- media/        images, video, audio',
+    '- attachments/  downloadable files',
+    '- snippets/     runnable code',
+    '- repositories/ full apps to run on a portal',
+    '- config/       sloth.json, theme.json, controls.json',
+    '- data/         survey responses (CSV), saved locally',
+    ''
+  ].join('\n'))
+
+  try { fs.writeFileSync(DOWNLOAD_MANIFEST, JSON.stringify({ zip: name + '.zip', files: files })) } catch (e) {}
+  try { cp.spawn('xdg-open', [DOWNLOAD_PROJECT_SENTINEL], { stdio: 'ignore', detached: true }).unref() } catch (e) {}
+  openMenu()
+  overlay.toast = 'preparing ' + name + '.zip…'
+  draw()
+  setTimeout(function () { if (mode === 'menu' && overlay) { overlay.toast = null; draw() } }, 3000)
 }
 
 var uploadTimer = null
@@ -1696,7 +2088,19 @@ function menuTutorial () {
 // Redraw dispatcher
 // ---------------------------------------------------------------------------
 
+// Tell the host page when we enter or leave the menu, so it can overlay the
+// PNG logo on the home screen (the terminal itself can't render images). Uses
+// the same xdg-open sentinel channel as upload; fires only on transitions.
+var lastScreenSignal = null
+function signalScreen () {
+  var screen = (mode === 'menu') ? 'sloth:menu' : 'sloth:deck'
+  if (screen === lastScreenSignal) return
+  lastScreenSignal = screen
+  try { cp.spawn('xdg-open', [screen], { stdio: 'ignore', detached: true }).unref() } catch (e) {}
+}
+
 function draw () {
+  signalScreen()
   switch (mode) {
     case 'menu': return drawMenu()
     case 'upload': return drawUpload()
@@ -1712,6 +2116,7 @@ function draw () {
     case 'graph': return drawGraph()
     case 'browse': return drawBrowse()
     case 'edit': return drawEditor()
+    case 'wizard': return drawWizard()
     case 'themepick': return drawThemePicker()
     case 'theme': return drawThemeEditor()
   }
@@ -1783,6 +2188,7 @@ keyStream.on('keypress', function (ch, key) {
   if (mode === 'browse') return browseKeys(ch, key)
   if (mode === 'graph') return graphKeys(ch, key)
   if (mode === 'themepick') return themePickerKeys(ch, key)
+  if (mode === 'wizard') return wizardKeys(ch, key)
   if (mode === 'theme') return themeKeys(ch, key)
   return presentKeys(ch, key)
 })
@@ -1954,6 +2360,7 @@ function browseKeys (ch, key) {
     loadDeck(chosen, true)
     if (intent === 'edit') return openEditor(overlay.back), draw() // quit edit returns where we came from
     if (intent === 'live') return startPresent() // audience-present this deck
+    if (intent === 'survey') return openSurveyWizard(), draw() // build a survey for this deck
     mode = 'present'
   }
   draw()
